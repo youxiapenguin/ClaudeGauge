@@ -1,0 +1,8 @@
+# 运行时生成 / 个人配置，不入库
+config.ini
+*.log
+_taskbar_shot.png
+
+# 临时/系统
+Thumbs.db
+desktop.ini
