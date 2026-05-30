@@ -4,7 +4,7 @@
 
 > 第三方小工具,**非 Anthropic 官方产品**。作者:初见 · 公众号:初见即安宁
 
-![screenshot](docs/screenshot.png)
+![ClaudeGauge 演示](docs/demo-hero.gif)
 
 ## 功能
 
@@ -16,6 +16,10 @@
 - **系统托盘图标**:悬停看三项用量 + 重置时间;右键弹出全部设置
 - 透明度可调、总是置顶、锁定位置、**开机自启**
 - 套餐名自动识别(如 Claude Max 20x)
+
+**7 套配色,右键随心换:**
+
+![主题切换](docs/demo-themes.gif)
 
 ## 运行前提(重要)
 
@@ -47,6 +51,8 @@ Win11 用户请使用悬浮窗模式。
 ## 原理
 
 后台启动 WSL 里的 `claude`,自动执行 `/usage`,用伪终端 + `pyte` 把界面还原成文本并解析出三个百分比;套餐等级读 `~/.claude/.credentials.json` 的对应字段(不读 token)。
+
+![工作原理](docs/demo-flow.gif)
 
 ## 从源码编译
 
