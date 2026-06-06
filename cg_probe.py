@@ -56,13 +56,26 @@ def ensure_pyte():
     # 都失败也不在这里报错；capture() 里 import pyte 会抛 -> 上层输出 OK=0
 
 
+def _find_claude():
+    """非登录 shell（软件用 wsl.exe 调用）的 PATH 不含 ~/.local/bin 等，
+    claude 找不到。这里补全常见安装目录并解析出 claude 真实路径。"""
+    import shutil
+    home = os.path.expanduser("~")
+    extra = [home + "/.local/bin", "/usr/local/bin", "/usr/bin",
+             home + "/bin", home + "/.npm-global/bin", "/usr/local/sbin"]
+    cur = os.environ.get("PATH", "")
+    os.environ["PATH"] = ":".join(extra) + (":" + cur if cur else "")
+    return shutil.which("claude") or "claude"
+
+
 def capture():
     ensure_pyte()
+    claude_path = _find_claude()   # 在 fork 前补好 PATH，子进程继承
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "xterm-256color"
         os.environ["COLUMNS"] = str(COLS); os.environ["LINES"] = str(ROWS)
-        os.execvp("claude", ["claude"])
+        os.execvp(claude_path, ["claude"])
         os._exit(1)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     import pyte
