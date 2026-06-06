@@ -28,7 +28,7 @@ using namespace Gdiplus;
 
 // ====== 配置 ======
 static const int REFRESH_MINUTES = 10;
-static const int STRIP_WIDTH_96  = 220;    // 任务栏条宽度（96 DPI）
+static const int STRIP_WIDTH_96  = 240;    // 任务栏条宽度（96 DPI）
 static const int FLOAT_W_96      = 196;    // 悬浮窗宽（含阴影边距）
 static const int FLOAT_H_96      = 108;    // 悬浮窗高
 static const int SHADOW_M_96     = 8;      // 阴影边距
@@ -269,14 +269,18 @@ static void WorkerLoop() {
         }
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            g_shared.sessionPct = sp; g_shared.weekallPct = wp; g_shared.sonnetPct = np;
-            g_shared.sessionRst = sr; g_shared.weekallRst = wr; g_shared.sonnetRst = nr;
-            g_shared.sessionRemain = sRem; g_shared.weekallRemain = wRem; g_shared.sonnetRemain = nRem;
-            if (!pl.empty()) g_shared.plan = pl;
+            if (ok) {   // 只在成功时更新数据；失败保留上次好数据，不清成 "--"
+                g_shared.sessionPct = sp; g_shared.weekallPct = wp; g_shared.sonnetPct = np;
+                g_shared.sessionRst = sr; g_shared.weekallRst = wr; g_shared.sonnetRst = nr;
+                g_shared.sessionRemain = sRem; g_shared.weekallRemain = wRem; g_shared.sonnetRemain = nRem;
+                if (!pl.empty()) g_shared.plan = pl;
+            }
             g_shared.ok = ok;
         }
         if (g_hwnd) PostMessageW(g_hwnd, WM_REFRESH, 0, 0);
-        for (int i = 0; i < REFRESH_MINUTES * 600 && !g_stop; ++i) Sleep(100);
+        // 自动重连：成功 10 分钟刷一次；失败 60 秒后立刻重试
+        int waitTenths = ok ? (REFRESH_MINUTES * 600) : 600;
+        for (int i = 0; i < waitTenths && !g_stop; ++i) Sleep(100);
     }
 }
 
@@ -350,19 +354,19 @@ static void PaintStrip(HWND hwnd, HDC hdc, RECT& rc) {
         usage = L"5H " + g_shared.sessionPct + L"  WEEK " + g_shared.weekallPct + L"  SNT " + g_shared.sonnetPct;
     }
     // 关键：NONANTIALIASED_QUALITY 关掉抗锯齿，避免文字边缘混入 colorkey 产生粉/紫毛边
-    HFONT f1 = CreateFontW(-DpiScale(12), 0,0,0, FW_BOLD, 0,0,0, GB2312_CHARSET,
+    HFONT f1 = CreateFontW(-DpiScale(13), 0,0,0, FW_BOLD, 0,0,0, GB2312_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, 0, L"Microsoft YaHei UI");
-    HFONT f2 = CreateFontW(-DpiScale(11), 0,0,0, FW_NORMAL, 0,0,0, GB2312_CHARSET,
+    HFONT f2 = CreateFontW(-DpiScale(13), 0,0,0, FW_NORMAL, 0,0,0, GB2312_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, 0, L"Microsoft YaHei UI");
     const Theme& th = THEMES[g_cfg.themeIdx];
     int half = (rc.bottom - rc.top) / 2;
-    RECT r1{ rc.left + DpiScale(4), rc.top + DpiScale(1), rc.right, rc.top + half + DpiScale(1) };
+    RECT r1{ rc.left + DpiScale(4), rc.top, rc.right, rc.top + half + DpiScale(1) };
     RECT r2{ rc.left + DpiScale(4), rc.top + half - DpiScale(1), rc.right, rc.bottom };
     HFONT old = (HFONT)SelectObject(hdc, f1);
-    SetTextColor(hdc, ok ? th.tbTitle : STRIP_WARN);   // 行1 套餐：深/亮
+    SetTextColor(hdc, ok ? th.tbTitle : STRIP_WARN);   // 行1 套餐
     DrawTextW(hdc, plan.c_str(), -1, &r1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
     SelectObject(hdc, f2);
-    SetTextColor(hdc, ok ? th.tbBody : STRIP_WARN);    // 行2 用量：浅
+    SetTextColor(hdc, ok ? th.tbTitle : STRIP_WARN);   // 行2 用量：也用亮色，更清楚
     DrawTextW(hdc, usage.c_str(), -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE);
     SelectObject(hdc, old); DeleteObject(f1); DeleteObject(f2);
 }

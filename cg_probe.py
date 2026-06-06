@@ -62,7 +62,8 @@ def _find_claude():
     import shutil
     home = os.path.expanduser("~")
     extra = [home + "/.local/bin", "/usr/local/bin", "/usr/bin",
-             home + "/bin", home + "/.npm-global/bin", "/usr/local/sbin"]
+             home + "/bin", home + "/.npm-global/bin", "/usr/local/sbin",
+             "/opt/homebrew/bin", "/opt/homebrew/sbin"]  # 后两个=macOS Apple 芯片 homebrew
     cur = os.environ.get("PATH", "")
     os.environ["PATH"] = ":".join(extra) + (":" + cur if cur else "")
     return shutil.which("claude") or "claude"
