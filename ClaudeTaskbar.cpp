@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <string>
 #include <map>
+#include <vector>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -95,6 +96,7 @@ struct Config {
     bool lockPos     = false;
     int  transparency = 90;     // 百分比
     int  x = 80, y = 80;
+    std::wstring distro;        // 指定的 WSL 发行版（空=自动探测/默认）
 };
 static Config g_cfg;
 
@@ -165,6 +167,9 @@ static void LoadConfig() {
     if (g_cfg.transparency > 100) g_cfg.transparency = 100;
     g_cfg.x = (int)GetPrivateProfileIntW(L"general", L"x", 80, p.c_str());
     g_cfg.y = (int)GetPrivateProfileIntW(L"general", L"y", 80, p.c_str());
+    wchar_t db[128];
+    GetPrivateProfileStringW(L"general", L"distro", L"", db, 128, p.c_str());
+    g_cfg.distro = db;
 }
 static void SaveConfig() {
     std::wstring p = CfgPath(); wchar_t n[16];
@@ -175,6 +180,7 @@ static void SaveConfig() {
     wsprintfW(n, L"%d", g_cfg.transparency); WritePrivateProfileStringW(L"general", L"transparency", n, p.c_str());
     wsprintfW(n, L"%d", g_cfg.x); WritePrivateProfileStringW(L"general", L"x", n, p.c_str());
     wsprintfW(n, L"%d", g_cfg.y); WritePrivateProfileStringW(L"general", L"y", n, p.c_str());
+    WritePrivateProfileStringW(L"general", L"distro", g_cfg.distro.c_str(), p.c_str());
 }
 
 // ---------- 自启动 ----------
@@ -196,23 +202,36 @@ static void SetAutostart(bool on) {
 }
 
 // ---------- 跑一条命令抓 stdout ----------
+// 关键：wsl.exe 在"无控制台(CREATE_NO_WINDOW) + stdout 是管道"时输出转发会失效、吐空。
+// 因此这里把子进程 stdout/stderr 重定向到一个真实临时文件句柄（文件句柄不走那套转发），
+// 进程结束后再把文件读回来。这样后台静默运行也能稳定拿到 wsl.exe 的输出。
 static std::string RunCmdCapture(const std::wstring& cmdline, DWORD timeoutMs) {
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE rd = nullptr, wr = nullptr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return "";
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-    std::wstring cmd = cmdline;
+    wchar_t tmpDir[MAX_PATH]; if (!GetTempPathW(MAX_PATH, tmpDir)) lstrcpyW(tmpDir, L"C:\\");
+    wchar_t tmpFile[MAX_PATH]; if (!GetTempFileNameW(tmpDir, L"cg", 0, tmpFile)) return "";
+
+    // 经 cmd.exe 重定向到该文件：cmd.exe /c <命令> > "tmpFile" 2>&1
+    // 必须走 cmd.exe —— 它会给 wsl.exe 分配隐藏控制台，wsl.exe 才肯在后台吐输出；
+    // 直接 CreateProcess(wsl.exe) + CREATE_NO_WINDOW 会拿到空输出。
+    std::wstring cmd = L"cmd.exe /c " + cmdline + L" > \"" + tmpFile + L"\" 2>&1";
     STARTUPINFOW si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = wr; si.hStdError = wr;
     PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(wr);
-    if (!ok) { CloseHandle(rd); return ""; }
-    std::string out; char buf[4096]; DWORD n = 0;
-    while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) out.append(buf, n);
-    CloseHandle(rd);
-    WaitForSingleObject(pi.hProcess, timeoutMs);
+    // 给子进程一个永远可被 wsl.exe 翻译的工作目录（C:\Windows）。否则若本程序的
+    // 工作目录是 UNC/\\wsl.localhost\... 之类，wsl.exe 会"Failed to translate"并输出空。
+    wchar_t winDir[MAX_PATH]; if (!GetWindowsDirectoryW(winDir, MAX_PATH)) lstrcpyW(winDir, L"C:\\");
+    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, winDir, &si, &pi);
+    if (!ok) { DeleteFileW(tmpFile); return ""; }
+    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+
+    std::string out;
+    HANDLE rf = CreateFileW(tmpFile, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (rf != INVALID_HANDLE_VALUE) {
+        char buf[4096]; DWORD n = 0;
+        while (ReadFile(rf, buf, sizeof(buf), &n, nullptr) && n > 0) out.append(buf, n);
+        CloseHandle(rf);
+    }
+    DeleteFileW(tmpFile);
     return out;
 }
 
@@ -234,10 +253,43 @@ static void ResolveProbe() {
     g_probeWsl = WinToWslPath(ExeDirFile(L"cg_probe.py"));
 }
 
+// ---------- WSL 发行版自动探测 ----------
+// 背景：用户机器上常有多个发行版（如默认是空壳的 docker-desktop），裸 wsl.exe
+// 会打到错的那个，找不到 python3/claude。这里自动挑出"装了 python3 且 claude 已登录"的发行版。
+static std::vector<std::wstring> ListDistros() {
+    std::string raw = RunCmdCapture(L"wsl.exe -l -q", 8000);   // 输出为 UTF-16LE
+    std::vector<std::wstring> out; std::wstring cur;
+    for (size_t i = 0; i + 1 < raw.size(); i += 2) {
+        wchar_t ch = (wchar_t)((unsigned char)raw[i] | ((unsigned char)raw[i + 1] << 8));
+        if (ch == L'\r') continue;
+        if (ch == L'\n' || ch == 0) { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
+        else cur += ch;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+// 该发行版里有 python3 且 ~/.claude/.credentials.json 存在（即已登录）→ 就是它
+static bool DistroUsable(const std::wstring& name) {
+    // 注意：wsl.exe 的 -d 不能给带引号的发行版名（它自解析命令行，会把引号算进名字 → NOT_FOUND）
+    std::wstring cmd = L"wsl.exe -d " + name +
+        L" python3 -c \"import os;print(os.path.exists(os.path.expanduser('~/.claude/.credentials.json')))\"";
+    return RunCmdCapture(cmd, 15000).find("True") != std::string::npos;
+}
+static void DetectDistro() {
+    if (!g_cfg.distro.empty() && DistroUsable(g_cfg.distro)) return;   // 已记住且仍可用
+    for (auto& d : ListDistros()) {
+        if (DistroUsable(d)) { g_cfg.distro = d; SaveConfig(); return; }
+    }
+    g_cfg.distro.clear();   // 没找到就退回裸 wsl.exe（至少不崩）
+}
+
 // ---------- 探针 ----------
 static std::string RunProbe() {
     if (g_probeWsl.empty()) return "";
-    return RunCmdCapture(L"wsl.exe python3 \"" + g_probeWsl + L"\"", 120000);
+    std::wstring cmd = L"wsl.exe ";
+    if (!g_cfg.distro.empty()) cmd += L"-d " + g_cfg.distro + L" ";   // 发行版名不能加引号
+    cmd += L"python3 \"" + g_probeWsl + L"\"";
+    return RunCmdCapture(cmd, 120000);
 }
 static std::map<std::string, std::string> ParseKV(const std::string& s) {
     std::map<std::string, std::string> m; size_t pos = 0;
@@ -253,8 +305,11 @@ static std::map<std::string, std::string> ParseKV(const std::string& s) {
 }
 static void WorkerLoop() {
     for (int i = 0; i < 15 && !g_stop; ++i) Sleep(100);
+    DetectDistro();   // 先挑出正确的 WSL 发行版（避免打到 docker-desktop 等空壳）
+    { std::string d; for (wchar_t c : g_cfg.distro) d += (char)c; Log("DetectDistro -> '" + d + "'"); }
     while (!g_stop) {
         auto kv = ParseKV(RunProbe());
+        Log("probe OK=" + kv["OK"] + " sess=" + kv["SESSION_PCT"] + " err=" + kv["ERR"]);
         std::wstring sp = L"--", wp = L"--", np = L"--", sr, wr, nr;
         std::wstring pl = kv["PLAN"].empty() ? L"" : Utf8ToWide(kv["PLAN"]);
         int sRem = -1, wRem = -1, nRem = -1;
