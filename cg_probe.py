@@ -72,6 +72,10 @@ def _find_claude():
 def capture():
     ensure_pyte()
     claude_path = _find_claude()   # 在 fork 前补好 PATH，子进程继承
+    try:
+        os.chdir(os.path.expanduser("~"))   # 固定家目录启动：信任一次后不再弹对话框
+    except Exception:
+        pass
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "xterm-256color"
@@ -96,14 +100,25 @@ def capture():
                     return
                 stream.feed(data)
 
-    drain(9)
-    os.write(fd, b"/usage")
-    time.sleep(1.0)
-    os.write(fd, b"\r")
-    drain(8)
+    def screen_has(sub):
+        return any(sub in l.lower() for l in screen.display)
+
+    drain(6)
+    # 接受"是否信任此文件夹"对话框（默认高亮就是 Yes，回车即可），否则它会挡住 /usage
+    for _ in range(15):
+        if screen_has("trust this folder"):
+            os.write(fd, b"\r"); time.sleep(0.6); break
+        if screen_has("? for shortcuts"):   # 已就绪且无对话框，别再空等
+            break
+        drain(1)
+    drain(1.5)
+    # 运行 /usage，轮询等待面板出现（应对新版启动/渲染变慢）
+    os.write(fd, b"/usage"); time.sleep(1.0); os.write(fd, b"\r")
+    for _ in range(22):
+        drain(1)
+        if screen_has("current session"):
+            drain(0.8); break
     try:
-        os.write(fd, b"\x1b")
-        time.sleep(0.3)
         os.kill(pid, 9)
     except OSError:
         pass

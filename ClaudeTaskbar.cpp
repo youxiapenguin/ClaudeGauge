@@ -342,6 +342,12 @@ static void Reposition(HWND hwnd) {
     MoveWindow(hwnd, x, 0, w, trayH, TRUE);
 }
 // 任务栏条：两行（套餐名 + 用量），colorkey 真透明
+// 把颜色往白色方向调淡 t（0~1）—— 用于任务栏下行"同色系浅一档"
+static COLORREF Lighten(COLORREF c, double t) {
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    r += (int)((255 - r) * t); g += (int)((255 - g) * t); b += (int)((255 - b) * t);
+    return RGB(r, g, b);
+}
 static void PaintStrip(HWND hwnd, HDC hdc, RECT& rc) {
     HBRUSH bg = CreateSolidBrush(STRIP_COLORKEY);
     FillRect(hdc, &rc, bg); DeleteObject(bg);
@@ -366,7 +372,7 @@ static void PaintStrip(HWND hwnd, HDC hdc, RECT& rc) {
     SetTextColor(hdc, ok ? th.tbTitle : STRIP_WARN);   // 行1 套餐
     DrawTextW(hdc, plan.c_str(), -1, &r1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
     SelectObject(hdc, f2);
-    SetTextColor(hdc, ok ? th.tbTitle : STRIP_WARN);   // 行2 用量：也用亮色，更清楚
+    SetTextColor(hdc, ok ? Lighten(th.tbTitle, 0.50) : STRIP_WARN);   // 行2 用量：同色系调淡(浅)+非粗体
     DrawTextW(hdc, usage.c_str(), -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE);
     SelectObject(hdc, old); DeleteObject(f1); DeleteObject(f2);
 }
