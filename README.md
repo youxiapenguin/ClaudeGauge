@@ -2,7 +2,7 @@
 
 在 **Windows 桌面 / 任务栏**实时显示 **Claude Code** 的用量(会话 5 小时窗口、本周全部模型、本周 Sonnet),并对会话窗口显示重置倒计时。
 
-> 第三方小工具,**非 Anthropic 官方产品**。作者:初见 · 公众号:初见即安宁
+> 第三方小工具,**非 Anthropic 官方产品**。作者:初见
 
 ![ClaudeGauge 演示](docs/demo-hero.gif)
 

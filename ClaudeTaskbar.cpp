@@ -744,8 +744,7 @@ static void OnCommand(HWND hwnd, int id) {
         case ID_ABOUT:
             MessageBoxW(hwnd,
                 L"ClaudeGauge   v1.0\n"
-                L"作者：初见\n"
-                L"公众号：初见即安宁\n\n"
+                L"作者：初见\n\n"
                 L"在桌面/任务栏显示 Claude Code 的用量。\n"
                 L"第三方小工具，非 Anthropic 官方产品。\n\n"
                 L"鸣谢：pyte、mingw-w64、GDI+",
