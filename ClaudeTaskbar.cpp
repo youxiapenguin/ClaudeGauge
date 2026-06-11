@@ -110,9 +110,11 @@ struct Shared {
 static Shared g_shared;
 
 // 剩余分钟 -> "剩 2h31m" / "剩 5天3h" / "剩 12m"（-1 返回空）
-static std::wstring RemainText(int m) {
+// compactDays=true 时多天只给"剩 N天"（悬浮窗行宽有限，避免和长标签 WEEKLY·SONNET 挤）
+static std::wstring RemainText(int m, bool compactDays = false) {
     if (m < 0) return L"";
     if (m >= 1440) { int d = m / 1440, h = (m % 1440) / 60;
+        if (compactDays) return L"剩 " + std::to_wstring(d) + L"天";
         return L"剩 " + std::to_wstring(d) + L"天" + (h ? std::to_wstring(h) + L"h" : L""); }
     if (m >= 60) { int h = m / 60, mm = m % 60; return L"剩 " + std::to_wstring(h) + L"h" + std::to_wstring(mm) + L"m"; }
     return L"剩 " + std::to_wstring(m) + L"m";
@@ -122,9 +124,14 @@ static std::wstring RemainText(int m) {
 static void Log(const std::string& s) {
     wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
     std::wstring lp = std::wstring(tmp) + L"ClaudeGauge.log";
+    // 超过 256KB 就清空重写，防止常驻几个月日志无限膨胀
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    bool tooBig = GetFileAttributesExW(lp.c_str(), GetFileExInfoStandard, &fa)
+                  && fa.nFileSizeLow > 256 * 1024;
     HANDLE h = CreateFileW(lp.c_str(),
-        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        FILE_APPEND_DATA | (tooBig ? GENERIC_WRITE : 0),
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        tooBig ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     SetFilePointer(h, 0, nullptr, FILE_END);
     std::string line = s + "\r\n"; DWORD w = 0;
@@ -516,8 +523,8 @@ static void RenderFloating() {
             RectF rowRect(left, ry, innerW, lineH);
             g.DrawString(rows[i].label, -1, &fLabel, rowRect, &sfNear, &brText);   // 标签（左）
             g.DrawString(rows[i].pct.c_str(), -1, &fLabel, rowRect, &sfFar, &brSub); // 百分比（最右）
-            // 剩余时间：只对"小于一天"的显示倒计时（如会话5h），多天的(周)不挤在条上
-            std::wstring rt = (rem[i] >= 0 && rem[i] < 1440) ? RemainText(rem[i]) : L"";
+            // 剩余时间：会话"剩 2h31m"，周"剩 N天"（紧凑），三行都显示
+            std::wstring rt = RemainText(rem[i], true);
             if (!rt.empty()) {
                 RectF rr(left, ry + (REAL)DpiScale(1), innerW - pctW - (REAL)DpiScale(4), lineH);
                 g.DrawString(rt.c_str(), -1, &fSmall, rr, &sfFar, &brSub);
@@ -539,9 +546,7 @@ static void RenderFloating() {
     POINT src{ 0, 0 }; SIZE sz{ W, H };
     BYTE alpha = (BYTE)(g_cfg.transparency * 255 / 100);
     BLENDFUNCTION bf{ AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA };
-    BOOL ulw = UpdateLayeredWindow(g_hwnd, screen, nullptr, &sz, mem, &src, 0, &bf, ULW_ALPHA);
-    Log("RenderFloating ULW=" + std::to_string(ulw) + " err=" + std::to_string(GetLastError())
-        + " WxH=" + std::to_string(W) + "x" + std::to_string(H) + " alpha=" + std::to_string(alpha));
+    UpdateLayeredWindow(g_hwnd, screen, nullptr, &sz, mem, &src, 0, &bf, ULW_ALPHA);
 
     SelectObject(mem, oldb); DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
 }
@@ -601,13 +606,18 @@ static void UpdateTrayTip() {
     std::wstring t;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
+        // 优先显示"剩多久"（szTip 上限 128 字符，比重置时刻更省也更直观）；没有才退回重置时刻
+        auto line = [](const std::wstring& pct, int remain, const std::wstring& rst) {
+            std::wstring s = pct;
+            std::wstring rt = RemainText(remain);
+            if (!rt.empty()) s += L" · " + rt;
+            else if (!rst.empty()) s += L" · 重置 " + rst;
+            return s;
+        };
         t  = g_shared.plan;
-        t += L"\r\n会话 " + g_shared.sessionPct;
-        if (!g_shared.sessionRst.empty()) t += L" · 重置 " + g_shared.sessionRst;
-        t += L"\r\n本周 " + g_shared.weekallPct;
-        if (!g_shared.weekallRst.empty()) t += L" · 重置 " + g_shared.weekallRst;
-        t += L"\r\nSonnet " + g_shared.sonnetPct;
-        if (!g_shared.sonnetRst.empty()) t += L" · 重置 " + g_shared.sonnetRst;
+        t += L"\r\n会话 "   + line(g_shared.sessionPct, g_shared.sessionRemain, g_shared.sessionRst);
+        t += L"\r\n本周 "   + line(g_shared.weekallPct, g_shared.weekallRemain, g_shared.weekallRst);
+        t += L"\r\nSonnet " + line(g_shared.sonnetPct,  g_shared.sonnetRemain,  g_shared.sonnetRst);
     }
     lstrcpynW(g_nid.szTip, t.c_str(), 128);
     g_nid.uFlags = NIF_TIP;
