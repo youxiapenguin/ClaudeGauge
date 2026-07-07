@@ -72,7 +72,7 @@ enum {
     ID_MODE_FLOAT = 1001, ID_MODE_TASKBAR,
     ID_TOPMOST, ID_LOCKPOS,
     ID_OPA_100, ID_OPA_90, ID_OPA_80, ID_OPA_70, ID_OPA_60,
-    ID_AUTOSTART, ID_ABOUT, ID_EXIT,
+    ID_AUTOSTART, ID_REFRESH_NOW, ID_ABOUT, ID_EXIT,
     ID_THEME_BASE = 1100,   // 主题 i = ID_THEME_BASE + i
 };
 #define WM_REFRESH (WM_APP + 1)
@@ -81,6 +81,7 @@ enum {
 
 static std::mutex        g_mtx;
 static std::atomic<bool> g_stop{false};
+static HANDLE            g_wake = nullptr;   // auto-reset 事件：唤醒 worker（立即刷新/退出）
 static HWND              g_hwnd       = nullptr;
 static UINT              g_taskbarMsg = 0;
 static HINSTANCE         g_hInst      = nullptr;
@@ -314,6 +315,7 @@ static void WorkerLoop() {
     for (int i = 0; i < 15 && !g_stop; ++i) Sleep(100);
     DetectDistro();   // 先挑出正确的 WSL 发行版（避免打到 docker-desktop 等空壳）
     { std::string d; for (wchar_t c : g_cfg.distro) d += (char)c; Log("DetectDistro -> '" + d + "'"); }
+    int fails = 0;   // 连续失败计数：满 3 次重探发行版（治启动时 WSL 没起/发行版失效）
     while (!g_stop) {
         auto kv = ParseKV(RunProbe());
         Log("probe OK=" + kv["OK"] + " sess=" + kv["SESSION_PCT"] + " err=" + kv["ERR"]);
@@ -340,16 +342,24 @@ static void WorkerLoop() {
             g_shared.ok = ok;
         }
         if (g_hwnd) PostMessageW(g_hwnd, WM_REFRESH, 0, 0);
-        // 自动重连：成功 10 分钟刷一次；失败 60 秒后立刻重试
-        int waitTenths = ok ? (REFRESH_MINUTES * 600) : 600;
-        for (int i = 0; i < waitTenths && !g_stop; ++i) Sleep(100);
+        if (ok) fails = 0;
+        else if (++fails >= 3) { DetectDistro(); fails = 0;   // 连败 3 次：重探发行版后清零，避免每轮都重探
+            std::string d; for (wchar_t c : g_cfg.distro) d += (char)c; Log("3 fails -> re-DetectDistro '" + d + "'"); }
+        // 自动重连：成功 10 分钟刷一次；失败 60 秒后重试；等待可被 g_wake 唤醒（立即刷新/退出）
+        DWORD waitMs = ok ? (REFRESH_MINUTES * 60 * 1000) : 60 * 1000;
+        WaitForSingleObject(g_wake, waitMs);
     }
 }
 
 // ---------- DPI ----------
+// 已 SetProcessDPIAware，进程生命周期内 DPI 不变：首次取一次缓存，免得每次重绘反复 GetDC
+static int g_dpi = 0;
 static int DpiScale(int v) {
-    HDC dc = GetDC(nullptr); int dpi = GetDeviceCaps(dc, LOGPIXELSX);
-    ReleaseDC(nullptr, dc); return MulDiv(v, dpi, 96);
+    if (!g_dpi) {
+        HDC dc = GetDC(nullptr); g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
+        ReleaseDC(nullptr, dc);
+    }
+    return MulDiv(v, g_dpi, 96);
 }
 static int PctToInt(const std::wstring& p) {
     int v = 0; bool any = false;
@@ -726,6 +736,7 @@ static void ShowContextMenu(HWND hwnd, int x, int y) {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (IsAutostart() ? MF_CHECKED : 0), ID_AUTOSTART, L"开机自启动");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_REFRESH_NOW, L"立即刷新");
     AppendMenuW(m, MF_STRING, ID_ABOUT, L"关于");
     AppendMenuW(m, MF_STRING, ID_EXIT, L"退出");
     SetForegroundWindow(hwnd);
@@ -751,6 +762,7 @@ static void OnCommand(HWND hwnd, int id) {
         case ID_OPA_70:  g_cfg.transparency = 70;  SaveConfig(); Refresh(hwnd); break;
         case ID_OPA_60:  g_cfg.transparency = 60;  SaveConfig(); Refresh(hwnd); break;
         case ID_AUTOSTART: SetAutostart(!IsAutostart()); break;
+        case ID_REFRESH_NOW: if (g_wake) SetEvent(g_wake); break;   // 唤醒 worker 立刻抓一次
         case ID_ABOUT:
             MessageBoxW(hwnd,
                 L"ClaudeGauge   v1.0\n"
@@ -760,7 +772,7 @@ static void OnCommand(HWND hwnd, int id) {
                 L"鸣谢：pyte、mingw-w64、GDI+",
                 L"关于 ClaudeGauge", MB_OK | MB_ICONINFORMATION);
             break;
-        case ID_EXIT: g_stop = true; DestroyWindow(hwnd); break;
+        case ID_EXIT: g_stop = true; if (g_wake) SetEvent(g_wake); DestroyWindow(hwnd); break;
     }
 }
 
@@ -818,7 +830,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_RBUTTONUP: { POINT pt; GetCursorPos(&pt); ShowContextMenu(hwnd, pt.x, pt.y); return 0; }
         case WM_COMMAND: OnCommand(hwnd, LOWORD(wp)); return 0;
-        case WM_DESTROY: g_stop = true; KillTimer(hwnd, 1); DestroyTooltip(); RemoveTrayIcon(); PostQuitMessage(0); return 0;
+        case WM_DESTROY: g_stop = true; if (g_wake) SetEvent(g_wake); KillTimer(hwnd, 1); DestroyTooltip(); RemoveTrayIcon(); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -855,6 +867,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ResolveProbe();   // 定位 exe 旁的 cg_probe.py（无写死路径）
     ApplyMode(g_hwnd);
     AddTrayIcon(g_hwnd);
+    g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset，先建再起线程
     std::thread(WorkerLoop).detach();
 
     MSG msg;

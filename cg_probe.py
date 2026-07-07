@@ -112,12 +112,21 @@ def capture():
             break
         drain(1)
     drain(1.5)
-    # 运行 /usage，轮询等待面板出现（应对新版启动/渲染变慢）
-    os.write(fd, b"/usage"); time.sleep(1.0); os.write(fd, b"\r")
-    for _ in range(22):
-        drain(1)
-        if screen_has("current session"):
-            drain(0.8); break
+    # 运行 /usage，轮询等面板出现。最多重发 3 次 /usage：首个命令常在 claude 还没就绪时
+    # 被吞、或面板渲染慢过轮询窗口，重发一次即可救回（实测偶发 ~50% 失败靠这个消除）。
+    got = False
+    for attempt in range(3):
+        # 先清掉可能残留的半截输入，再发 /usage
+        os.write(fd, b"\x15")  # Ctrl-U 清行
+        time.sleep(0.2)
+        os.write(fd, b"/usage"); time.sleep(1.0); os.write(fd, b"\r")
+        for _ in range(20):     # 每轮最多等 ~20s
+            drain(1)
+            if screen_has("current session"):
+                drain(1.2)      # 多等一下让三段百分比都渲染出来
+                got = True; break
+        if got:
+            break
     try:
         os.kill(pid, 9)
     except OSError:
