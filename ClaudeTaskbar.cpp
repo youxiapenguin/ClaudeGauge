@@ -226,10 +226,29 @@ static std::string RunCmdCapture(const std::wstring& cmdline, DWORD timeoutMs) {
     // 给子进程一个永远可被 wsl.exe 翻译的工作目录（C:\Windows）。否则若本程序的
     // 工作目录是 UNC/\\wsl.localhost\... 之类，wsl.exe 会"Failed to translate"并输出空。
     wchar_t winDir[MAX_PATH]; if (!GetWindowsDirectoryW(winDir, MAX_PATH)) lstrcpyW(winDir, L"C:\\");
-    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, winDir, &si, &pi);
-    if (!ok) { DeleteFileW(tmpFile); return ""; }
-    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+
+    // Job Object 兜底：cmd.exe 会再 fork 出 wsl.exe，若 wsl.exe 本身卡死不返回，
+    // 之前超时只 TerminateProcess 了 cmd.exe，孙进程 wsl.exe 就成孤儿永久挂着——
+    // 攒得多了会堵死 WSL 的调度队列，导致新请求也跟着卡死（2026-07 实测攒了几百个
+    // 孤儿 wsl.exe 把 WSL 拖垮，新起的 wsl -d Ubuntu 直接超时无响应）。
+    // CREATE_SUSPENDED 先挂起进程、分配进 Job 后再 Resume，保证 cmd.exe 之后 fork
+    // 出的 wsl.exe 也落在同一个 Job 里；超时时 TerminateJobObject 把整棵进程树一起清掉。
+    HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
+    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                              CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, winDir, &si, &pi);
+    if (!ok) { if (hJob) CloseHandle(hJob); DeleteFileW(tmpFile); return ""; }
+    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+    ResumeThread(pi.hThread);
+    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_TIMEOUT) {
+        if (hJob) TerminateJobObject(hJob, 1); else TerminateProcess(pi.hProcess, 1);
+    }
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    if (hJob) CloseHandle(hJob);   // KILL_ON_JOB_CLOSE：若还有存活的子孙进程，关句柄时一并清掉
 
     std::string out;
     HANDLE rf = CreateFileW(tmpFile, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
