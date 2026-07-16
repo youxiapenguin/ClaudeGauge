@@ -1,5 +1,5 @@
 /*********************************************************
- * Claude Code 用量桌面工具（独立程序）
+ * Kimi for Coding 用量桌面工具（独立程序，由 Claude 用量工具改造）
  * ------------------------------------------------------
  * 两种显示形态，右键菜单切换并持久化到 config.ini：
  *   形态1 悬浮窗：分层窗口（UpdateLayeredWindow + GDI+），圆角卡片 + 柔和
@@ -7,23 +7,26 @@
  *                 白/黑两套主题；透明度/置顶/锁定位置可调。
  *   形态2 任务栏条：SetParent 嵌进 Shell_TrayWnd，真透明（LWA_COLORKEY），
  *                 两行（套餐名 + 精简用量），悬停弹 tooltip 看重置时间。
- * 数据：后台线程每 REFRESH_MINUTES 调一次 WSL 探针，解析 key=value 缓存。
+ * 数据：后台线程每 REFRESH_MINUTES 用 WinINet 原生 HTTPS 调一次
+ *       https://api.kimi.com/coding/v1/usages（Bearer 认证，nlohmann/json 解析）。
+ *       返回的数值全是字符串形式的百分比：usage=本周配额、limits[0]=5 小时
+ *       滑动窗口、parallel=并发会话、totalQuota=总池。实测纯查询不耗配额。
  * 嵌入任务栏的手法参考开源项目 TrafficMonitor 的同类公开 Win32 思路，
  * 本程序为独立重写，未复制其源码。
- * 编译：mingw-w64（见 build.sh，链接 -lgdiplus）
+ * 编译：mingw-w64（见 build.sh，链接 -lgdiplus -lwininet）
  *********************************************************/
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <gdiplus.h>
+#include <wininet.h>
 #include <algorithm>
 #include <string>
-#include <map>
-#include <vector>
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include "json.hpp"
 
 using namespace Gdiplus;
 
@@ -33,8 +36,6 @@ static const int STRIP_WIDTH_96  = 240;    // 任务栏条宽度（96 DPI）
 static const int FLOAT_W_96      = 196;    // 悬浮窗宽（含阴影边距）
 static const int FLOAT_H_96      = 108;    // 悬浮窗高
 static const int SHADOW_M_96     = 8;      // 阴影边距
-// 探针在 WSL 里的路径：运行时由 exe 旁边的 cg_probe.py 推导（无写死个人路径，整个文件夹可移植）
-static std::wstring g_probeWsl;
 
 static const COLORREF STRIP_COLORKEY = RGB(255, 0, 255);
 static const COLORREF STRIP_TEXT     = RGB(255, 255, 255);
@@ -97,15 +98,16 @@ struct Config {
     bool lockPos     = false;
     int  transparency = 90;     // 百分比
     int  x = 80, y = 80;
-    std::wstring distro;        // 指定的 WSL 发行版（空=自动探测/默认）
+    std::wstring apiKey;        // Kimi for Coding API Key（[kimi] api_key）
 };
 static Config g_cfg;
 
 struct Shared {
-    std::wstring sessionPct = L"--", weekallPct = L"--", sonnetPct = L"--";
-    std::wstring sessionRst, weekallRst, sonnetRst;
-    std::wstring plan = L"Claude Max";
-    int sessionRemain = -1, weekallRemain = -1, sonnetRemain = -1;  // 距重置剩余分钟，-1=未知
+    std::wstring fivehPct = L"--", weekPct = L"--", poolPct = L"--";
+    std::wstring fivehRst, weekRst;                       // 重置时刻（本地 "07-23 17:18"），总池无
+    std::wstring plan = L"Kimi";
+    int fivehRemain = -1, weekRemain = -1;                // 距重置剩余分钟，-1=未知/已过期
+    int parUsed = 0, parLimit = 0;                        // 并发会话 当前/上限
     bool ok = false;
 };
 static Shared g_shared;
@@ -175,9 +177,9 @@ static void LoadConfig() {
     if (g_cfg.transparency > 100) g_cfg.transparency = 100;
     g_cfg.x = (int)GetPrivateProfileIntW(L"general", L"x", 80, p.c_str());
     g_cfg.y = (int)GetPrivateProfileIntW(L"general", L"y", 80, p.c_str());
-    wchar_t db[128];
-    GetPrivateProfileStringW(L"general", L"distro", L"", db, 128, p.c_str());
-    g_cfg.distro = db;
+    wchar_t kb[512];
+    GetPrivateProfileStringW(L"kimi", L"api_key", L"", kb, 512, p.c_str());
+    g_cfg.apiKey = kb;
 }
 static void SaveConfig() {
     std::wstring p = CfgPath(); wchar_t n[16];
@@ -188,7 +190,7 @@ static void SaveConfig() {
     wsprintfW(n, L"%d", g_cfg.transparency); WritePrivateProfileStringW(L"general", L"transparency", n, p.c_str());
     wsprintfW(n, L"%d", g_cfg.x); WritePrivateProfileStringW(L"general", L"x", n, p.c_str());
     wsprintfW(n, L"%d", g_cfg.y); WritePrivateProfileStringW(L"general", L"y", n, p.c_str());
-    WritePrivateProfileStringW(L"general", L"distro", g_cfg.distro.c_str(), p.c_str());
+    // [kimi] api_key 只在 LoadConfig 读，这里绝不回写，避免把 key 截断/覆盖
 }
 
 // ---------- 自启动 ----------
@@ -209,162 +211,147 @@ static void SetAutostart(bool on) {
     RegCloseKey(k);
 }
 
-// ---------- 跑一条命令抓 stdout ----------
-// 关键：wsl.exe 在"无控制台(CREATE_NO_WINDOW) + stdout 是管道"时输出转发会失效、吐空。
-// 因此这里把子进程 stdout/stderr 重定向到一个真实临时文件句柄（文件句柄不走那套转发），
-// 进程结束后再把文件读回来。这样后台静默运行也能稳定拿到 wsl.exe 的输出。
-static std::string RunCmdCapture(const std::wstring& cmdline, DWORD timeoutMs) {
-    wchar_t tmpDir[MAX_PATH]; if (!GetTempPathW(MAX_PATH, tmpDir)) lstrcpyW(tmpDir, L"C:\\");
-    wchar_t tmpFile[MAX_PATH]; if (!GetTempFileNameW(tmpDir, L"cg", 0, tmpFile)) return "";
+// ---------- Kimi for Coding 用量接口（WinINet 原生 HTTPS）----------
+struct KimiUsage {
+    int fivehUsed = -1, weekUsed = -1, poolUsed = -1;   // 已用百分比，-1=无数据
+    int fivehRemain = -1, weekRemain = -1;              // 距重置分钟，-1=无/已过期
+    std::wstring fivehRst, weekRst;                     // 重置时刻（本地短格式）
+    std::wstring level;                                 // 会员等级原始值 LEVEL_*
+    int parUsed = 0, parLimit = 0;
+    std::string err;                                    // 空 = 成功
+};
 
-    // 经 cmd.exe 重定向到该文件：cmd.exe /c <命令> > "tmpFile" 2>&1
-    // 必须走 cmd.exe —— 它会给 wsl.exe 分配隐藏控制台，wsl.exe 才肯在后台吐输出；
-    // 直接 CreateProcess(wsl.exe) + CREATE_NO_WINDOW 会拿到空输出。
-    std::wstring cmd = L"cmd.exe /c " + cmdline + L" > \"" + tmpFile + L"\" 2>&1";
-    STARTUPINFOW si{}; si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    // 给子进程一个永远可被 wsl.exe 翻译的工作目录（C:\Windows）。否则若本程序的
-    // 工作目录是 UNC/\\wsl.localhost\... 之类，wsl.exe 会"Failed to translate"并输出空。
-    wchar_t winDir[MAX_PATH]; if (!GetWindowsDirectoryW(winDir, MAX_PATH)) lstrcpyW(winDir, L"C:\\");
-
-    // Job Object 兜底：cmd.exe 会再 fork 出 wsl.exe，若 wsl.exe 本身卡死不返回，
-    // 之前超时只 TerminateProcess 了 cmd.exe，孙进程 wsl.exe 就成孤儿永久挂着——
-    // 攒得多了会堵死 WSL 的调度队列，导致新请求也跟着卡死（2026-07 实测攒了几百个
-    // 孤儿 wsl.exe 把 WSL 拖垮，新起的 wsl -d Ubuntu 直接超时无响应）。
-    // CREATE_SUSPENDED 先挂起进程、分配进 Job 后再 Resume，保证 cmd.exe 之后 fork
-    // 出的 wsl.exe 也落在同一个 Job 里；超时时 TerminateJobObject 把整棵进程树一起清掉。
-    HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
-    if (hJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-    }
-    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
-                              CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, winDir, &si, &pi);
-    if (!ok) { if (hJob) CloseHandle(hJob); DeleteFileW(tmpFile); return ""; }
-    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
-    ResumeThread(pi.hThread);
-    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_TIMEOUT) {
-        if (hJob) TerminateJobObject(hJob, 1); else TerminateProcess(pi.hProcess, 1);
-    }
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    if (hJob) CloseHandle(hJob);   // KILL_ON_JOB_CLOSE：若还有存活的子孙进程，关句柄时一并清掉
-
-    std::string out;
-    HANDLE rf = CreateFileW(tmpFile, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
-    if (rf != INVALID_HANDLE_VALUE) {
-        char buf[4096]; DWORD n = 0;
-        while (ReadFile(rf, buf, sizeof(buf), &n, nullptr) && n > 0) out.append(buf, n);
-        CloseHandle(rf);
-    }
-    DeleteFileW(tmpFile);
-    return out;
+// "2026-07-23T17:18:57.116725Z"（UTC）-> SYSTEMTIME；失败返回 false
+static bool IsoToFileTime(const std::string& iso, FILETIME& ft) {
+    int Y, M, D, h, m, s;
+    if (sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) < 6) return false;
+    SYSTEMTIME st{}; st.wYear = (WORD)Y; st.wMonth = (WORD)M; st.wDay = (WORD)D;
+    st.wHour = (WORD)h; st.wMinute = (WORD)m; st.wSecond = (WORD)s;
+    return SystemTimeToFileTime(&st, &ft) != 0;
+}
+// 距现在分钟数；已过去/解析失败返回 -1（5h 窗口闲置时 resetTime 会在过去）
+static int IsoToRemainMinutes(const std::string& iso) {
+    FILETIME ft, now;
+    if (!IsoToFileTime(iso, ft)) return -1;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER a{}, b{};
+    a.LowPart = ft.dwLowDateTime;  a.HighPart = ft.dwHighDateTime;
+    b.LowPart = now.dwLowDateTime; b.HighPart = now.dwHighDateTime;
+    if (a.QuadPart <= b.QuadPart) return -1;
+    return (int)((a.QuadPart - b.QuadPart) / 10000000ULL / 60ULL);
+}
+// UTC ISO -> 本地短格式 "07-23 17:18"（tooltip 用）；失败返回空
+static std::wstring IsoToLocalShort(const std::string& iso) {
+    FILETIME ft, lft; SYSTEMTIME st;
+    if (!IsoToFileTime(iso, ft)) return L"";
+    if (!FileTimeToLocalFileTime(&ft, &lft)) return L"";
+    if (!FileTimeToSystemTime(&lft, &st)) return L"";
+    wchar_t buf[32];
+    wsprintfW(buf, L"%02d-%02d %02d:%02d", st.wMonth, st.wDay, st.wHour, st.wMinute);
+    return buf;
 }
 
-// Windows 路径 -> WSL 路径：直接字符串转换（D:\a\b -> /mnt/d/a/b），
-// 不调 wslpath，避免中文路径经 wsl.exe 参数桥时的编码问题。
-static std::wstring WinToWslPath(const std::wstring& winPath) {
-    if (winPath.size() >= 2 && winPath[1] == L':') {
-        std::wstring r = L"/mnt/";
-        r += (wchar_t)towlower(winPath[0]);
-        r += winPath.substr(2);
-        for (auto& c : r) if (c == L'\\') c = L'/';
-        return r;
+static bool HttpGet(const wchar_t* url, const std::wstring& headers, std::string& out, std::string& err) {
+    HINTERNET hNet = InternetOpenW(L"ClaudeGauge/2.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hNet) { err = "InternetOpen err=" + std::to_string(GetLastError()); return false; }
+    DWORD timeout = 15000;   // 连接/收发各 15s 兜底，worker 线程卡住也不怕
+    InternetSetOptionW(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOptionW(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOptionW(hNet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    HINTERNET hUrl = InternetOpenUrlW(hNet, url, headers.c_str(), (DWORD)headers.size(),
+        INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    if (!hUrl) { err = "OpenUrl err=" + std::to_string(GetLastError()); InternetCloseHandle(hNet); return false; }
+    DWORD status = 0, sz = sizeof(status);
+    HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &sz, nullptr);
+    if (status != 200) {
+        err = "HTTP " + std::to_string(status);
+        InternetCloseHandle(hUrl); InternetCloseHandle(hNet); return false;
     }
-    return winPath;
+    char buf[16384]; DWORD n = 0;
+    while (InternetReadFile(hUrl, buf, sizeof(buf), &n) && n > 0) out.append(buf, n);
+    InternetCloseHandle(hUrl); InternetCloseHandle(hNet);
+    if (out.empty()) err = "empty body";
+    return !out.empty();
 }
 
-// 定位 exe 旁边的 cg_probe.py，换算成 WSL 路径
-static void ResolveProbe() {
-    g_probeWsl = WinToWslPath(ExeDirFile(L"cg_probe.py"));
+static KimiUsage FetchKimiUsage() {
+    KimiUsage r;
+    if (g_cfg.apiKey.empty()) { r.err = "config.ini 缺 [kimi] api_key"; return r; }
+    std::string body;
+    std::wstring auth = L"Authorization: Bearer " + g_cfg.apiKey + L"\r\n";
+    if (!HttpGet(L"https://api.kimi.com/coding/v1/usages", auth, body, r.err)) return r;
+    try {
+        auto j = nlohmann::json::parse(body);
+        // 数值字段全是字符串形式的百分比（"17"），兼容数字写法
+        auto pct = [](const nlohmann::json& o, const char* k) -> int {
+            if (!o.is_object() || !o.contains(k)) return -1;
+            const auto& v = o[k];
+            if (v.is_string()) return atoi(v.get<std::string>().c_str());
+            if (v.is_number()) return v.get<int>();
+            return -1;
+        };
+        // 本周配额（resetTime ≈ 6 天后）
+        const auto& u = j["usage"];
+        r.weekUsed = pct(u, "used");
+        std::string urt = u.value("resetTime", "");
+        r.weekRemain = IsoToRemainMinutes(urt);
+        r.weekRst = IsoToLocalShort(urt);
+        // 5 小时滑动窗口（300 分钟；闲置时 resetTime 可能在过去 → Remain=-1 不显示倒数）
+        if (j.contains("limits") && j["limits"].is_array() && !j["limits"].empty()) {
+            const auto& d = j["limits"][0]["detail"];
+            r.fivehUsed = pct(d, "used");
+            std::string frt = d.value("resetTime", "");
+            r.fivehRemain = IsoToRemainMinutes(frt);
+            r.fivehRst = IsoToLocalShort(frt);
+        }
+        // 总池：只有 remaining，used% = 100 - remaining；无重置时间
+        int poolRem = pct(j["totalQuota"], "remaining");
+        if (poolRem >= 0) r.poolUsed = 100 - poolRem;
+        // 并发会话
+        const auto& pa = j["parallel"];
+        r.parLimit = pct(pa, "limit");
+        if (pa.contains("details") && pa["details"].is_array()) r.parUsed = (int)pa["details"].size();
+        // 会员等级
+        if (j.contains("user") && j["user"].contains("membership"))
+            r.level = Utf8ToWide(j["user"]["membership"].value("level", ""));
+    } catch (const std::exception& e) {
+        r.err = std::string("json: ") + e.what();
+        r.fivehUsed = r.weekUsed = r.poolUsed = -1;   // 解析失败不当成功数据
+    }
+    return r;
 }
 
-// ---------- WSL 发行版自动探测 ----------
-// 背景：用户机器上常有多个发行版（如默认是空壳的 docker-desktop），裸 wsl.exe
-// 会打到错的那个，找不到 python3/claude。这里自动挑出"装了 python3 且 claude 已登录"的发行版。
-static std::vector<std::wstring> ListDistros() {
-    std::string raw = RunCmdCapture(L"wsl.exe -l -q", 8000);   // 输出为 UTF-16LE
-    std::vector<std::wstring> out; std::wstring cur;
-    for (size_t i = 0; i + 1 < raw.size(); i += 2) {
-        wchar_t ch = (wchar_t)((unsigned char)raw[i] | ((unsigned char)raw[i + 1] << 8));
-        if (ch == L'\r') continue;
-        if (ch == L'\n' || ch == 0) { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
-        else cur += ch;
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-// 该发行版里有 python3 且 ~/.claude/.credentials.json 存在（即已登录）→ 就是它
-static bool DistroUsable(const std::wstring& name) {
-    // 注意：wsl.exe 的 -d 不能给带引号的发行版名（它自解析命令行，会把引号算进名字 → NOT_FOUND）
-    std::wstring cmd = L"wsl.exe -d " + name +
-        L" python3 -c \"import os;print(os.path.exists(os.path.expanduser('~/.claude/.credentials.json')))\"";
-    return RunCmdCapture(cmd, 15000).find("True") != std::string::npos;
-}
-static void DetectDistro() {
-    if (!g_cfg.distro.empty() && DistroUsable(g_cfg.distro)) return;   // 已记住且仍可用
-    for (auto& d : ListDistros()) {
-        if (DistroUsable(d)) { g_cfg.distro = d; SaveConfig(); return; }
-    }
-    g_cfg.distro.clear();   // 没找到就退回裸 wsl.exe（至少不崩）
+static std::wstring LevelText(const std::wstring& lv) {
+    if (lv == L"LEVEL_ADVANCED") return L"高级版";
+    if (lv == L"LEVEL_PROFESSIONAL") return L"专业版";
+    return lv;   // 未知等级原样显示
 }
 
-// ---------- 探针 ----------
-static std::string RunProbe() {
-    if (g_probeWsl.empty()) return "";
-    std::wstring cmd = L"wsl.exe ";
-    if (!g_cfg.distro.empty()) cmd += L"-d " + g_cfg.distro + L" ";   // 发行版名不能加引号
-    cmd += L"python3 \"" + g_probeWsl + L"\"";
-    return RunCmdCapture(cmd, 120000);
-}
-static std::map<std::string, std::string> ParseKV(const std::string& s) {
-    std::map<std::string, std::string> m; size_t pos = 0;
-    while (pos < s.size()) {
-        size_t nl = s.find('\n', pos);
-        std::string line = s.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
-        pos = (nl == std::string::npos) ? s.size() : nl + 1;
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-        size_t eq = line.find('=');
-        if (eq != std::string::npos) m[line.substr(0, eq)] = line.substr(eq + 1);
-    }
-    return m;
-}
 static void WorkerLoop() {
     for (int i = 0; i < 15 && !g_stop; ++i) Sleep(100);
-    DetectDistro();   // 先挑出正确的 WSL 发行版（避免打到 docker-desktop 等空壳）
-    { std::string d; for (wchar_t c : g_cfg.distro) d += (char)c; Log("DetectDistro -> '" + d + "'"); }
-    int fails = 0;   // 连续失败计数：满 3 次重探发行版（治启动时 WSL 没起/发行版失效）
     while (!g_stop) {
-        auto kv = ParseKV(RunProbe());
-        Log("probe OK=" + kv["OK"] + " sess=" + kv["SESSION_PCT"] + " err=" + kv["ERR"]);
-        std::wstring sp = L"--", wp = L"--", np = L"--", sr, wr, nr;
-        std::wstring pl = kv["PLAN"].empty() ? L"" : Utf8ToWide(kv["PLAN"]);
-        int sRem = -1, wRem = -1, nRem = -1;
-        bool ok = false;
-        if (kv["OK"] == "1") {
-            ok = true;
-            auto pct = [](const std::string& p) { return p.empty() ? std::wstring(L"--") : Utf8ToWide(p) + L"%"; };
-            auto toi = [](const std::string& v) { return v.empty() ? -1 : atoi(v.c_str()); };
-            sp = pct(kv["SESSION_PCT"]); wp = pct(kv["WEEKALL_PCT"]); np = pct(kv["WEEKSONNET_PCT"]);
-            sr = Utf8ToWide(kv["SESSION_RESET"]); wr = Utf8ToWide(kv["WEEKALL_RESET"]); nr = Utf8ToWide(kv["WEEKSONNET_RESET"]);
-            sRem = toi(kv["SESSION_REMAIN"]); wRem = toi(kv["WEEKALL_REMAIN"]); nRem = toi(kv["WEEKSONNET_REMAIN"]);
-        }
+        if (g_cfg.apiKey.empty()) LoadConfig();   // 允许后补 api_key 到 config.ini，无需重启
+        KimiUsage u = FetchKimiUsage();
+        bool ok = u.err.empty();
+        Log("kimi ok=" + std::to_string(ok) + " 5h=" + std::to_string(u.fivehUsed) +
+            " week=" + std::to_string(u.weekUsed) + " pool=" + std::to_string(u.poolUsed) +
+            " par=" + std::to_string(u.parUsed) + "/" + std::to_string(u.parLimit) + " err=" + u.err);
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             if (ok) {   // 只在成功时更新数据；失败保留上次好数据，不清成 "--"
-                g_shared.sessionPct = sp; g_shared.weekallPct = wp; g_shared.sonnetPct = np;
-                g_shared.sessionRst = sr; g_shared.weekallRst = wr; g_shared.sonnetRst = nr;
-                g_shared.sessionRemain = sRem; g_shared.weekallRemain = wRem; g_shared.sonnetRemain = nRem;
-                if (!pl.empty()) g_shared.plan = pl;
+                auto p = [](int v) { return v < 0 ? std::wstring(L"--") : std::to_wstring(v) + L"%"; };
+                g_shared.fivehPct = p(u.fivehUsed); g_shared.weekPct = p(u.weekUsed); g_shared.poolPct = p(u.poolUsed);
+                g_shared.fivehRst = u.fivehRst; g_shared.weekRst = u.weekRst;
+                g_shared.fivehRemain = u.fivehRemain; g_shared.weekRemain = u.weekRemain;
+                g_shared.parUsed = u.parUsed; g_shared.parLimit = u.parLimit;
+                std::wstring pl = L"Kimi " + LevelText(u.level);
+                if (u.parLimit > 0) pl += L" · 并发 " + std::to_wstring(u.parUsed) + L"/" + std::to_wstring(u.parLimit);
+                g_shared.plan = pl;
             }
             g_shared.ok = ok;
         }
         if (g_hwnd) PostMessageW(g_hwnd, WM_REFRESH, 0, 0);
-        if (ok) fails = 0;
-        else if (++fails >= 3) { DetectDistro(); fails = 0;   // 连败 3 次：重探发行版后清零，避免每轮都重探
-            std::string d; for (wchar_t c : g_cfg.distro) d += (char)c; Log("3 fails -> re-DetectDistro '" + d + "'"); }
-        // 自动重连：成功 10 分钟刷一次；失败 60 秒后重试；等待可被 g_wake 唤醒（立即刷新/退出）
+        // 成功 10 分钟刷一次；失败 60 秒后重试；等待可被 g_wake 唤醒（立即刷新/退出）
         DWORD waitMs = ok ? (REFRESH_MINUTES * 60 * 1000) : 60 * 1000;
         WaitForSingleObject(g_wake, waitMs);
     }
@@ -448,7 +435,7 @@ static void PaintStrip(HWND hwnd, HDC hdc, RECT& rc) {
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         ok = g_shared.ok; plan = g_shared.plan;
-        usage = L"5H " + g_shared.sessionPct + L"  WEEK " + g_shared.weekallPct + L"  SNT " + g_shared.sonnetPct;
+        usage = L"5H " + g_shared.fivehPct + L"  周 " + g_shared.weekPct + L"  池 " + g_shared.poolPct;
     }
     // 关键：NONANTIALIASED_QUALITY 关掉抗锯齿，避免文字边缘混入 colorkey 产生粉/紫毛边
     HFONT f1 = CreateFontW(-DpiScale(13), 0,0,0, FW_BOLD, 0,0,0, GB2312_CHARSET,
@@ -498,8 +485,8 @@ static void RenderFloating() {
     std::wstring sp, wp, np, pl; int rem[3];
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        sp = g_shared.sessionPct; wp = g_shared.weekallPct; np = g_shared.sonnetPct; pl = g_shared.plan;
-        rem[0] = g_shared.sessionRemain; rem[1] = g_shared.weekallRemain; rem[2] = g_shared.sonnetRemain;
+        sp = g_shared.fivehPct; wp = g_shared.weekPct; np = g_shared.poolPct; pl = g_shared.plan;
+        rem[0] = g_shared.fivehRemain; rem[1] = g_shared.weekRemain; rem[2] = -1;   // 总池无重置时间
     }
 
     {
@@ -537,7 +524,7 @@ static void RenderFloating() {
 
         // 三行
         struct Row { const wchar_t* label; std::wstring pct; };
-        Row rows[3] = { { L"SESSION · 5H", sp }, { L"WEEKLY · ALL", wp }, { L"WEEKLY · SONNET", np } };
+        Row rows[3] = { { L"5小时窗口", sp }, { L"本周配额", wp }, { L"总池", np } };
         float rowsTop = cy + (REAL)DpiScale(28);
         float rowH = (REAL)DpiScale(22);
         float lineH = (REAL)DpiScale(14);
@@ -610,7 +597,7 @@ static HICON MakeTrayIcon() {
     Font f(&fam, 21.0f, FontStyleBold, UnitPixel);
     SolidBrush wb(Color(255, 0x1c, 0x1c, 0x1c));
     StringFormat sf; sf.SetAlignment(StringAlignmentCenter); sf.SetLineAlignment(StringAlignmentCenter);
-    g.DrawString(L"C", -1, &f, RectF(0, 1, (REAL)s, (REAL)s), &sf, &wb);
+    g.DrawString(L"K", -1, &f, RectF(0, 1, (REAL)s, (REAL)s), &sf, &wb);
     HICON ic = nullptr; bmp.GetHICON(&ic);
     return ic;
 }
@@ -622,14 +609,14 @@ static void AddTrayIcon(HWND hwnd) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_trayIcon;
-    lstrcpynW(g_nid.szTip, L"Claude 用量 — 右键设置", 64);
+    lstrcpynW(g_nid.szTip, L"Kimi 用量 — 右键设置", 64);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 static void RemoveTrayIcon() {
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = nullptr; }
 }
-// 把用量+重置时间写进托盘图标的悬停提示（悬停那个"C"图标即可看到，稳定可靠）
+// 把用量+重置时间写进托盘图标的悬停提示（悬停那个"K"图标即可看到，稳定可靠）
 static void UpdateTrayTip() {
     if (g_nid.cbSize == 0) return;
     std::wstring t;
@@ -644,9 +631,9 @@ static void UpdateTrayTip() {
             return s;
         };
         t  = g_shared.plan;
-        t += L"\r\n会话 "   + line(g_shared.sessionPct, g_shared.sessionRemain, g_shared.sessionRst);
-        t += L"\r\n本周 "   + line(g_shared.weekallPct, g_shared.weekallRemain, g_shared.weekallRst);
-        t += L"\r\nSonnet " + line(g_shared.sonnetPct,  g_shared.sonnetRemain,  g_shared.sonnetRst);
+        t += L"\r\n5H窗口 " + line(g_shared.fivehPct, g_shared.fivehRemain, g_shared.fivehRst);
+        t += L"\r\n本周 "   + line(g_shared.weekPct,  g_shared.weekRemain,  g_shared.weekRst);
+        t += L"\r\n总池 "   + g_shared.poolPct;   // 总池无重置时间
     }
     lstrcpynW(g_nid.szTip, t.c_str(), 128);
     g_nid.uFlags = NIF_TIP;
@@ -661,12 +648,11 @@ static void UpdateTooltipText() {
     std::wstring tip;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        tip  = L"SESSION 5H: " + g_shared.sessionPct;
-        if (!g_shared.sessionRst.empty()) tip += L" (resets " + g_shared.sessionRst + L")";
-        tip += L"\r\nWEEKLY ALL: " + g_shared.weekallPct;
-        if (!g_shared.weekallRst.empty()) tip += L" (resets " + g_shared.weekallRst + L")";
-        tip += L"\r\nWEEKLY SONNET: " + g_shared.sonnetPct;
-        if (!g_shared.sonnetRst.empty()) tip += L" (resets " + g_shared.sonnetRst + L")";
+        tip  = L"5小时窗口: " + g_shared.fivehPct;
+        if (!g_shared.fivehRst.empty()) tip += L" (重置 " + g_shared.fivehRst + L")";
+        tip += L"\r\n本周配额: " + g_shared.weekPct;
+        if (!g_shared.weekRst.empty()) tip += L" (重置 " + g_shared.weekRst + L")";
+        tip += L"\r\n总池: " + g_shared.poolPct;
     }
     TOOLINFOW ti{}; ti.cbSize = sizeof(ti); ti.hwnd = g_hwnd; ti.uId = (UINT_PTR)g_hwnd;
     ti.lpszText = &tip[0];
@@ -784,11 +770,11 @@ static void OnCommand(HWND hwnd, int id) {
         case ID_REFRESH_NOW: if (g_wake) SetEvent(g_wake); break;   // 唤醒 worker 立刻抓一次
         case ID_ABOUT:
             MessageBoxW(hwnd,
-                L"ClaudeGauge   v1.0\n"
+                L"ClaudeGauge   v2.0（Kimi 版）\n"
                 L"作者：初见\n\n"
-                L"在桌面/任务栏显示 Claude Code 的用量。\n"
-                L"第三方小工具，非 Anthropic 官方产品。\n\n"
-                L"鸣谢：pyte、mingw-w64、GDI+",
+                L"在桌面/任务栏显示 Kimi for Coding 的用量。\n"
+                L"第三方小工具，非月之暗面官方产品。\n\n"
+                L"鸣谢：WinINet、nlohmann/json、mingw-w64、GDI+",
                 L"关于 ClaudeGauge", MB_OK | MB_ICONINFORMATION);
             break;
         case ID_EXIT: g_stop = true; if (g_wake) SetEvent(g_wake); DestroyWindow(hwnd); break;
@@ -817,11 +803,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             if (g_cfg.taskbarMode) { Reposition(hwnd); InvalidateRect(hwnd, nullptr, FALSE); UpdateTooltipText(); }
-            else {   // 悬浮窗：剩余分钟各减 1，重绘倒数
+            else {   // 悬浮窗：剩余分钟各减 1，重绘倒数（总池无倒数）
                 { std::lock_guard<std::mutex> lk(g_mtx);
-                  if (g_shared.sessionRemain > 0) g_shared.sessionRemain--;
-                  if (g_shared.weekallRemain > 0) g_shared.weekallRemain--;
-                  if (g_shared.sonnetRemain  > 0) g_shared.sonnetRemain--; }
+                  if (g_shared.fivehRemain > 0) g_shared.fivehRemain--;
+                  if (g_shared.weekRemain > 0) g_shared.weekRemain--; }
                 RenderFloating();
             }
             return 0;
@@ -883,7 +868,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     Log("CreateWindow hwnd=" + std::to_string((size_t)g_hwnd) + " err=" + std::to_string(GetLastError()));
     if (!g_hwnd) return 1;
 
-    ResolveProbe();   // 定位 exe 旁的 cg_probe.py（无写死路径）
     ApplyMode(g_hwnd);
     AddTrayIcon(g_hwnd);
     g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset，先建再起线程

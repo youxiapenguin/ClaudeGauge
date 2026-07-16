@@ -12,7 +12,7 @@ echo "编译器：$CXX"
 "$CXX" -std=c++17 -O2 -mwindows \
     -static -static-libgcc -static-libstdc++ \
     -o ClaudeGauge.exe ClaudeTaskbar.cpp \
-    -lgdi32 -luser32 -lkernel32 -ladvapi32 -lcomctl32 -lgdiplus -lshell32 -lole32
+    -lgdi32 -luser32 -lkernel32 -ladvapi32 -lcomctl32 -lgdiplus -lshell32 -lole32 -lwininet
 
 echo "==> 已生成 $(pwd)/ClaudeGauge.exe"
 ls -la ClaudeGauge.exe
