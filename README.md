@@ -16,6 +16,7 @@
 - **倒计时**:5 小时窗口显示"剩 Xh Ym",本周显示"剩 N天",每分钟本地递减
 - **系统托盘图标**:悬停看三项用量 + 重置时间;右键弹出全部设置
 - 透明度可调、总是置顶、锁定位置、**开机自启**
+- **多账户/备用密钥**:在 `config.ini` 里加 `api_key_2`、`api_key_3`… 即可同时显示多个 Kimi 账户。每个 key 可配 `name` / `name_2` 作为显示名（如"大号"/"备用"）。只配一个 key 时界面和原来一样;多 key 时悬浮窗自动纵向拉长、任务栏条自动横向扩展。
 - 套餐等级自动识别(如 Kimi 高级版),附并发会话数(如 并发 2/30)
 
 ## 运行前提
@@ -25,8 +26,13 @@
 
 ```ini
 [kimi]
-api_key =sk-你的key
+api_key  = sk-大号key
+name     = 大号
+api_key_2 = sk-备用key
+name_2   = 备用
 ```
+
+需要更多账户继续加 `api_key_3`、`name_3`… 即可(目前支持到 `api_key_10`)。
 
 > Key 即 Claude Code 接入 Kimi 时用的 `ANTHROPIC_API_KEY`(Kimi for Coding 订阅颁发)。
 > `config.ini` 已在 `.gitignore` 里,key 不会进仓库。

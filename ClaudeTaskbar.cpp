@@ -32,9 +32,10 @@ using namespace Gdiplus;
 
 // ====== 配置 ======
 static const int REFRESH_MINUTES = 10;
-static const int STRIP_WIDTH_96  = 240;    // 任务栏条宽度（96 DPI）
+static const int STRIP_WIDTH_96  = 240;    // 任务栏条每账户宽度（96 DPI）
 static const int FLOAT_W_96      = 196;    // 悬浮窗宽（含阴影边距）
-static const int FLOAT_H_96      = 108;    // 悬浮窗高
+static const int FLOAT_H_96      = 108;    // 单账户悬浮窗总高
+static const int ACCOUNT_H_96    = 92;     // 每多一个账户增加的高度
 static const int SHADOW_M_96     = 8;      // 阴影边距
 
 static const COLORREF STRIP_COLORKEY = RGB(255, 0, 255);
@@ -91,6 +92,11 @@ static ULONG_PTR         g_gdip       = 0;
 static NOTIFYICONDATAW   g_nid{};
 static HICON             g_trayIcon   = nullptr;
 
+struct AccountCfg {
+    std::wstring name;   // 显示名（如"大号"），空则显示套餐名
+    std::wstring key;    // Kimi for Coding API Key
+};
+
 struct Config {
     bool taskbarMode = false;
     int  themeIdx    = 0;       // 0..THEME_COUNT-1
@@ -98,19 +104,22 @@ struct Config {
     bool lockPos     = false;
     int  transparency = 90;     // 百分比
     int  x = 80, y = 80;
-    std::wstring apiKey;        // Kimi for Coding API Key（[kimi] api_key）
+    std::vector<AccountCfg> accounts;   // 支持多个 key：api_key, api_key_2...
 };
 static Config g_cfg;
 
-struct Shared {
+// 单个账户的实时数据
+struct AccountData {
+    std::wstring name;                                // 账户显示名
     std::wstring fivehPct = L"--", weekPct = L"--", poolPct = L"--";
-    std::wstring fivehRst, weekRst;                       // 重置时刻（本地 "07-23 17:18"），总池无
+    std::wstring fivehRst, weekRst;                   // 重置时刻（本地 "07-23 17:18"），总池无
     std::wstring plan = L"Kimi";
-    int fivehRemain = -1, weekRemain = -1;                // 距重置剩余分钟，-1=未知/已过期
-    int parUsed = 0, parLimit = 0;                        // 并发会话 当前/上限
+    int fivehRemain = -1, weekRemain = -1;            // 距重置剩余分钟，-1=未知/已过期
+    int parUsed = 0, parLimit = 0;                    // 并发会话 当前/上限
     bool ok = false;
 };
-static Shared g_shared;
+static std::vector<AccountData> g_accounts;
+static int g_accountCount = 0;   // 上次成功渲染时的账户数（用于窗口尺寸/位置计算）
 
 // 剩余分钟 -> "剩 2h31m" / "剩 5天3h" / "剩 12m"（-1 返回空）
 // compactDays=true 时多天只给"剩 N天"（悬浮窗行宽有限，避免和长标签 WEEKLY·SONNET 挤）
@@ -177,9 +186,27 @@ static void LoadConfig() {
     if (g_cfg.transparency > 100) g_cfg.transparency = 100;
     g_cfg.x = (int)GetPrivateProfileIntW(L"general", L"x", 80, p.c_str());
     g_cfg.y = (int)GetPrivateProfileIntW(L"general", L"y", 80, p.c_str());
-    wchar_t kb[512];
-    GetPrivateProfileStringW(L"kimi", L"api_key", L"", kb, 512, p.c_str());
-    g_cfg.apiKey = kb;
+
+    // 读取多个 key：api_key / name, api_key_2 / name_2, ... 一直到 api_key_10 / name_10
+    g_cfg.accounts.clear();
+    wchar_t kb[512], nb[64];
+    for (int i = 1; i <= 10; ++i) {
+        wchar_t keyName[32], nameName[32];
+        if (i == 1) {
+            wcscpy(keyName, L"api_key");
+            wcscpy(nameName, L"name");
+        } else {
+            wsprintfW(keyName, L"api_key_%d", i);
+            wsprintfW(nameName, L"name_%d", i);
+        }
+        GetPrivateProfileStringW(L"kimi", keyName, L"", kb, 512, p.c_str());
+        if (wcslen(kb) == 0) continue;   // 跳过空位，允许中间有空行
+        AccountCfg ac;
+        ac.key = kb;
+        GetPrivateProfileStringW(L"kimi", nameName, L"", nb, 64, p.c_str());
+        ac.name = nb;
+        g_cfg.accounts.push_back(ac);
+    }
 }
 static void SaveConfig() {
     std::wstring p = CfgPath(); wchar_t n[16];
@@ -190,7 +217,7 @@ static void SaveConfig() {
     wsprintfW(n, L"%d", g_cfg.transparency); WritePrivateProfileStringW(L"general", L"transparency", n, p.c_str());
     wsprintfW(n, L"%d", g_cfg.x); WritePrivateProfileStringW(L"general", L"x", n, p.c_str());
     wsprintfW(n, L"%d", g_cfg.y); WritePrivateProfileStringW(L"general", L"y", n, p.c_str());
-    // [kimi] api_key 只在 LoadConfig 读，这里绝不回写，避免把 key 截断/覆盖
+    // [kimi] api_key / name 只在 LoadConfig 读，这里绝不回写，避免把 key 截断/覆盖
 }
 
 // ---------- 自启动 ----------
@@ -274,11 +301,11 @@ static bool HttpGet(const wchar_t* url, const std::wstring& headers, std::string
     return !out.empty();
 }
 
-static KimiUsage FetchKimiUsage() {
+static KimiUsage FetchKimiUsage(const std::wstring& key) {
     KimiUsage r;
-    if (g_cfg.apiKey.empty()) { r.err = "config.ini 缺 [kimi] api_key"; return r; }
+    if (key.empty()) { r.err = "config.ini 缺 [kimi] api_key"; return r; }
     std::string body;
-    std::wstring auth = L"Authorization: Bearer " + g_cfg.apiKey + L"\r\n";
+    std::wstring auth = L"Authorization: Bearer " + key + L"\r\n";
     if (!HttpGet(L"https://api.kimi.com/coding/v1/usages", auth, body, r.err)) return r;
     try {
         auto j = nlohmann::json::parse(body);
@@ -330,29 +357,50 @@ static std::wstring LevelText(const std::wstring& lv) {
 static void WorkerLoop() {
     for (int i = 0; i < 15 && !g_stop; ++i) Sleep(100);
     while (!g_stop) {
-        if (g_cfg.apiKey.empty()) LoadConfig();   // 允许后补 api_key 到 config.ini，无需重启
-        KimiUsage u = FetchKimiUsage();
-        bool ok = u.err.empty();
-        Log("kimi ok=" + std::to_string(ok) + " 5h=" + std::to_string(u.fivehUsed) +
-            " week=" + std::to_string(u.weekUsed) + " pool=" + std::to_string(u.poolUsed) +
-            " par=" + std::to_string(u.parUsed) + "/" + std::to_string(u.parLimit) + " err=" + u.err);
+        LoadConfig();   // 允许热更新：用户改 config.ini 加 key 无需重启
+        int nAcc = (int)g_cfg.accounts.size();
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            if (ok) {   // 只在成功时更新数据；失败保留上次好数据，不清成 "--"
-                auto p = [](int v) { return v < 0 ? std::wstring(L"--") : std::to_wstring(v) + L"%"; };
-                g_shared.fivehPct = p(u.fivehUsed); g_shared.weekPct = p(u.weekUsed); g_shared.poolPct = p(u.poolUsed);
-                g_shared.fivehRst = u.fivehRst; g_shared.weekRst = u.weekRst;
-                g_shared.fivehRemain = u.fivehRemain; g_shared.weekRemain = u.weekRemain;
-                g_shared.parUsed = u.parUsed; g_shared.parLimit = u.parLimit;
-                std::wstring pl = L"Kimi " + LevelText(u.level);
-                if (u.parLimit > 0) pl += L" · 并发 " + std::to_wstring(u.parUsed) + L"/" + std::to_wstring(u.parLimit);
-                g_shared.plan = pl;
+            g_accounts.resize(nAcc);
+            for (int i = 0; i < nAcc; ++i) g_accounts[i].name = g_cfg.accounts[i].name;
+        }
+        if (nAcc == 0) {
+            Log("no api keys configured");
+            WaitForSingleObject(g_wake, 5000);
+            continue;
+        }
+        bool anyOk = false, anyFail = false;
+        for (int i = 0; i < nAcc; ++i) {
+            KimiUsage u = FetchKimiUsage(g_cfg.accounts[i].key);
+            bool ok = u.err.empty();
+            if (ok) anyOk = true; else anyFail = true;
+            Log("kimi account=" + std::to_string(i) +
+                " ok=" + std::to_string(ok) +
+                " 5h=" + std::to_string(u.fivehUsed) +
+                " week=" + std::to_string(u.weekUsed) +
+                " pool=" + std::to_string(u.poolUsed) +
+                " par=" + std::to_string(u.parUsed) + "/" + std::to_string(u.parLimit) +
+                " err=" + u.err);
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                auto& a = g_accounts[i];
+                a.name = g_cfg.accounts[i].name;
+                if (ok) {   // 只在成功时更新该账户数据；失败保留该账户上次好数据
+                    auto p = [](int v) { return v < 0 ? std::wstring(L"--") : std::to_wstring(v) + L"%"; };
+                    a.fivehPct = p(u.fivehUsed); a.weekPct = p(u.weekUsed); a.poolPct = p(u.poolUsed);
+                    a.fivehRst = u.fivehRst; a.weekRst = u.weekRst;
+                    a.fivehRemain = u.fivehRemain; a.weekRemain = u.weekRemain;
+                    a.parUsed = u.parUsed; a.parLimit = u.parLimit;
+                    std::wstring pl = L"Kimi " + LevelText(u.level);
+                    if (u.parLimit > 0) pl += L" · 并发 " + std::to_wstring(u.parUsed) + L"/" + std::to_wstring(u.parLimit);
+                    a.plan = pl;
+                }
+                a.ok = ok;
             }
-            g_shared.ok = ok;
         }
         if (g_hwnd) PostMessageW(g_hwnd, WM_REFRESH, 0, 0);
-        // 成功 10 分钟刷一次；失败 60 秒后重试；等待可被 g_wake 唤醒（立即刷新/退出）
-        DWORD waitMs = ok ? (REFRESH_MINUTES * 60 * 1000) : 60 * 1000;
+        // 全部成功 10 分钟；任一失败 60 秒后重试；可被 g_wake 唤醒
+        DWORD waitMs = anyFail ? 60 * 1000 : (REFRESH_MINUTES * 60 * 1000);
         WaitForSingleObject(g_wake, waitMs);
     }
 }
@@ -413,7 +461,15 @@ static void Reposition(HWND hwnd) {
     ctx.ourPid = GetCurrentProcessId(); ctx.center = tr.left + trayW / 2;
     ctx.rightLimit = rightLimitScreen; ctx.obstacleLeft = 0x7fffffff;
     EnumChildWindows(tray, EnumChildProc, (LPARAM)&ctx);
-    int w = DpiScale(STRIP_WIDTH_96), gap = DpiScale(6);
+
+    int N = 1;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        N = std::max(1, (int)g_accounts.size());
+    }
+    int colW = DpiScale(STRIP_WIDTH_96);
+    int w = colW * N;
+    int gap = DpiScale(6);
     int anchorRight = (ctx.obstacleLeft != 0x7fffffff) ? ctx.obstacleLeft - gap : rightLimitScreen - gap;
     POINT p{ anchorRight - w, tr.top }; ScreenToClient(tray, &p);
     int x = p.x; if (x < 0) x = 0;
@@ -431,27 +487,42 @@ static void PaintStrip(HWND hwnd, HDC hdc, RECT& rc) {
     FillRect(hdc, &rc, bg); DeleteObject(bg);
     SetBkMode(hdc, TRANSPARENT);
 
-    std::wstring plan, usage; bool ok;
+    int N = 1;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        ok = g_shared.ok; plan = g_shared.plan;
-        usage = L"5H " + g_shared.fivehPct + L"  周 " + g_shared.weekPct + L"  池 " + g_shared.poolPct;
+        N = std::max(1, (int)g_accounts.size());
     }
+    int colW = ((rc.right - rc.left) + N / 2) / N;   // 四舍五入分栏
+
     // 关键：NONANTIALIASED_QUALITY 关掉抗锯齿，避免文字边缘混入 colorkey 产生粉/紫毛边
-    HFONT f1 = CreateFontW(-DpiScale(13), 0,0,0, FW_BOLD, 0,0,0, GB2312_CHARSET,
+    HFONT f1 = CreateFontW(-DpiScale(12), 0,0,0, FW_BOLD, 0,0,0, GB2312_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, 0, L"Microsoft YaHei UI");
-    HFONT f2 = CreateFontW(-DpiScale(13), 0,0,0, FW_NORMAL, 0,0,0, GB2312_CHARSET,
+    HFONT f2 = CreateFontW(-DpiScale(12), 0,0,0, FW_NORMAL, 0,0,0, GB2312_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, 0, L"Microsoft YaHei UI");
     const Theme& th = THEMES[g_cfg.themeIdx];
     int half = (rc.bottom - rc.top) / 2;
-    RECT r1{ rc.left + DpiScale(4), rc.top, rc.right, rc.top + half + DpiScale(1) };
-    RECT r2{ rc.left + DpiScale(4), rc.top + half - DpiScale(1), rc.right, rc.bottom };
     HFONT old = (HFONT)SelectObject(hdc, f1);
-    SetTextColor(hdc, ok ? th.tbTitle : STRIP_WARN);   // 行1 套餐
-    DrawTextW(hdc, plan.c_str(), -1, &r1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
-    SelectObject(hdc, f2);
-    SetTextColor(hdc, ok ? Lighten(th.tbTitle, 0.50) : STRIP_WARN);   // 行2 用量：同色系调淡(浅)+非粗体
-    DrawTextW(hdc, usage.c_str(), -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE);
+
+    for (int ai = 0; ai < N; ++ai) {
+        AccountData a;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            if (ai < (int)g_accounts.size()) a = g_accounts[ai];
+        }
+        int left = rc.left + ai * colW + DpiScale(4);
+        int right = rc.left + (ai + 1) * colW - DpiScale(2);
+        if (right <= left) continue;
+        RECT r1{ left, rc.top, right, rc.top + half + DpiScale(1) };
+        RECT r2{ left, rc.top + half - DpiScale(1), right, rc.bottom };
+        std::wstring title = a.name.empty() ? a.plan : a.name;
+        std::wstring usage = L"5H " + a.fivehPct + L" 周 " + a.weekPct + L" 池 " + a.poolPct;
+        SetTextColor(hdc, a.ok ? th.tbTitle : STRIP_WARN);
+        DrawTextW(hdc, title.c_str(), -1, &r1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, f2);
+        SetTextColor(hdc, a.ok ? Lighten(th.tbTitle, 0.50) : STRIP_WARN);
+        DrawTextW(hdc, usage.c_str(), -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, f1);
+    }
     SelectObject(hdc, old); DeleteObject(f1); DeleteObject(f2);
 }
 
@@ -469,7 +540,16 @@ static void AddRoundRect(GraphicsPath& path, float x, float y, float w, float h,
 
 static void RenderFloating() {
     if (!g_hwnd) return;
-    int W = DpiScale(FLOAT_W_96), H = DpiScale(FLOAT_H_96), SM = DpiScale(SHADOW_M_96);
+    int W = DpiScale(FLOAT_W_96);
+    int accountH = DpiScale(ACCOUNT_H_96);
+    int SM = DpiScale(SHADOW_M_96);
+    int N = 1;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        N = std::max(1, (int)g_accounts.size());
+    }
+    g_accountCount = N;
+    int H = SM * 2 + accountH * N;
     const Theme& th = THEMES[g_cfg.themeIdx];
 
     HDC screen = GetDC(nullptr);
@@ -481,12 +561,12 @@ static void RenderFloating() {
     HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ oldb = SelectObject(mem, dib);
 
-    // 取数据
-    std::wstring sp, wp, np, pl; int rem[3];
+    std::vector<AccountData> accs(N);
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        sp = g_shared.fivehPct; wp = g_shared.weekPct; np = g_shared.poolPct; pl = g_shared.plan;
-        rem[0] = g_shared.fivehRemain; rem[1] = g_shared.weekRemain; rem[2] = -1;   // 总池无重置时间
+        for (int i = 0; i < N; ++i) {
+            if (i < (int)g_accounts.size()) accs[i] = g_accounts[i];
+        }
     }
 
     {
@@ -496,36 +576,32 @@ static void RenderFloating() {
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 
-        float cx = (float)SM, cy = (float)SM - DpiScale(1);
-        float cw = (float)(W - 2 * SM), ch = (float)(H - 2 * SM);
+        float cx = (float)SM, cyBase = (float)SM - DpiScale(1);
+        float cw = (float)(W - 2 * SM);
         float rad = (float)DpiScale(10);
 
         // 柔和阴影（多层低 alpha 扩散）
         for (int i = DpiScale(6); i >= 1; --i) {
             GraphicsPath sp2;
-            AddRoundRect(sp2, cx - i, cy + DpiScale(2), cw + 2 * i, ch + 2 * i, rad + i);
+            AddRoundRect(sp2, cx - i, cyBase + DpiScale(2), cw + 2 * i, accountH * N + 2 * i, rad + i);
             SolidBrush sb(Color(10, 0, 0, 0));
             g.FillPath(&sb, &sp2);
         }
-        // 卡片
-        GraphicsPath card; AddRoundRect(card, cx, cy, cw, ch, rad);
+        // 卡片（统一一个圆角大卡片，多账户时纵向拉长）
+        GraphicsPath card; AddRoundRect(card, cx, cyBase, cw, (float)(accountH * N), rad);
         SolidBrush cb(th.fbg); g.FillPath(&cb, &card);
 
         float pad = (float)DpiScale(11);
         float left = cx + pad, innerR = cx + cw - pad, innerW = innerR - left;
 
         FontFamily fam(L"Microsoft YaHei UI");
-        Font fTitle(&fam, (REAL)DpiScale(14), FontStyleBold, UnitPixel);
+        Font fTitle(&fam, (REAL)DpiScale(13), FontStyleBold, UnitPixel);
         Font fLabel(&fam, (REAL)DpiScale(10), FontStyleRegular, UnitPixel);
-        SolidBrush brTitle(th.ftitle), brText(th.fbody), brSub(th.fbody);
-
-        // 标题
-        g.DrawString(pl.c_str(), -1, &fTitle, PointF(left, cy + (REAL)DpiScale(7)), &brTitle);
+        SolidBrush brTitle(th.ftitle), brText(th.fbody);
 
         // 三行
-        struct Row { const wchar_t* label; std::wstring pct; };
-        Row rows[3] = { { L"5小时窗口", sp }, { L"本周配额", wp }, { L"总池", np } };
-        float rowsTop = cy + (REAL)DpiScale(28);
+        struct Row { const wchar_t* label; int remIdx; };
+        Row rows[3] = { { L"5小时窗口", 0 }, { L"本周配额", 1 }, { L"总池", -1 } };
         float rowH = (REAL)DpiScale(22);
         float lineH = (REAL)DpiScale(14);
         float barH = (REAL)DpiScale(4);
@@ -534,27 +610,39 @@ static void RenderFloating() {
         StringFormat sfFar; sfFar.SetAlignment(StringAlignmentFar);
         StringFormat sfNear; sfNear.SetAlignment(StringAlignmentNear);
 
-        for (int i = 0; i < 3; ++i) {
-            float ry = rowsTop + i * rowH;
-            RectF rowRect(left, ry, innerW, lineH);
-            g.DrawString(rows[i].label, -1, &fLabel, rowRect, &sfNear, &brText);   // 标签（左）
-            g.DrawString(rows[i].pct.c_str(), -1, &fLabel, rowRect, &sfFar, &brSub); // 百分比（最右）
-            // 剩余时间：会话"剩 2h31m"，周"剩 N天"（紧凑），三行都显示
-            std::wstring rt = RemainText(rem[i], true);
-            if (!rt.empty()) {
-                RectF rr(left, ry + (REAL)DpiScale(1), innerW - pctW - (REAL)DpiScale(4), lineH);
-                g.DrawString(rt.c_str(), -1, &fSmall, rr, &sfFar, &brSub);
-            }
-            // 整行宽进度条
-            float by = ry + lineH + (REAL)DpiScale(2);
-            float br = barH / 2.0f;
-            GraphicsPath track; AddRoundRect(track, left, by, innerW, barH, br);
-            SolidBrush tb(th.fbarBg); g.FillPath(&tb, &track);
-            int pv = PctToInt(rows[i].pct); if (pv < 0) pv = 0; if (pv > 100) pv = 100;
-            float fw = innerW * pv / 100.0f;
-            if (fw > barH) {
-                GraphicsPath fill; AddRoundRect(fill, left, by, fw, barH, br);
-                SolidBrush fb(th.fbarFg); g.FillPath(&fb, &fill);
+        for (int ai = 0; ai < N; ++ai) {
+            float cy = cyBase + ai * accountH;
+            const AccountData& a = accs[ai];
+            std::wstring title = a.name.empty() ? a.plan : a.name;
+
+            // 标题
+            g.DrawString(title.c_str(), -1, &fTitle, PointF(left, cy + (REAL)DpiScale(6)), &brTitle);
+
+            float rowsTop = cy + (REAL)DpiScale(25);
+            std::wstring pcts[3] = { a.fivehPct, a.weekPct, a.poolPct };
+            int rems[3] = { a.fivehRemain, a.weekRemain, -1 };
+            for (int i = 0; i < 3; ++i) {
+                float ry = rowsTop + i * rowH;
+                RectF rowRect(left, ry, innerW, lineH);
+                g.DrawString(rows[i].label, -1, &fLabel, rowRect, &sfNear, &brText);   // 标签（左）
+                g.DrawString(pcts[i].c_str(), -1, &fLabel, rowRect, &sfFar, &brText);  // 百分比（最右）
+                // 剩余时间：会话"剩 2h31m"，周"剩 N天"（紧凑）
+                std::wstring rt = RemainText(rems[i], true);
+                if (!rt.empty()) {
+                    RectF rr(left, ry + (REAL)DpiScale(1), innerW - pctW - (REAL)DpiScale(4), lineH);
+                    g.DrawString(rt.c_str(), -1, &fSmall, rr, &sfFar, &brText);
+                }
+                // 整行宽进度条
+                float by = ry + lineH + (REAL)DpiScale(2);
+                float br = barH / 2.0f;
+                GraphicsPath track; AddRoundRect(track, left, by, innerW, barH, br);
+                SolidBrush tb(th.fbarBg); g.FillPath(&tb, &track);
+                int pv = PctToInt(pcts[i]); if (pv < 0) pv = 0; if (pv > 100) pv = 100;
+                float fw = innerW * pv / 100.0f;
+                if (fw > barH) {
+                    GraphicsPath fill; AddRoundRect(fill, left, by, fw, barH, br);
+                    SolidBrush fb(th.fbarFg); g.FillPath(&fb, &fill);
+                }
             }
         }
     }
@@ -566,7 +654,6 @@ static void RenderFloating() {
 
     SelectObject(mem, oldb); DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
 }
-
 // 任务栏条绘制走 WM_PAINT
 static void OnPaintStrip(HWND hwnd) {
     PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
@@ -622,7 +709,6 @@ static void UpdateTrayTip() {
     std::wstring t;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        // 优先显示"剩多久"（szTip 上限 128 字符，比重置时刻更省也更直观）；没有才退回重置时刻
         auto line = [](const std::wstring& pct, int remain, const std::wstring& rst) {
             std::wstring s = pct;
             std::wstring rt = RemainText(remain);
@@ -630,11 +716,16 @@ static void UpdateTrayTip() {
             else if (!rst.empty()) s += L" · 重置 " + rst;
             return s;
         };
-        t  = g_shared.plan;
-        t += L"\r\n5H窗口 " + line(g_shared.fivehPct, g_shared.fivehRemain, g_shared.fivehRst);
-        t += L"\r\n本周 "   + line(g_shared.weekPct,  g_shared.weekRemain,  g_shared.weekRst);
-        t += L"\r\n总池 "   + g_shared.poolPct;   // 总池无重置时间
+        for (size_t i = 0; i < g_accounts.size(); ++i) {
+            const AccountData& a = g_accounts[i];
+            if (i > 0) t += L"\r\n";
+            t += (a.name.empty() ? a.plan : a.name);
+            t += L"\r\n5H " + line(a.fivehPct, a.fivehRemain, a.fivehRst);
+            t += L"\r\n周 " + line(a.weekPct, a.weekRemain, a.weekRst);
+            t += L"\r\n池 " + a.poolPct;
+        }
     }
+    if (t.empty()) t = L"Kimi 用量 — 右键设置";
     lstrcpynW(g_nid.szTip, t.c_str(), 128);
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -648,14 +739,22 @@ static void UpdateTooltipText() {
     std::wstring tip;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        tip  = L"5小时窗口: " + g_shared.fivehPct;
-        if (!g_shared.fivehRst.empty()) tip += L" (重置 " + g_shared.fivehRst + L")";
-        tip += L"\r\n本周配额: " + g_shared.weekPct;
-        if (!g_shared.weekRst.empty()) tip += L" (重置 " + g_shared.weekRst + L")";
-        tip += L"\r\n总池: " + g_shared.poolPct;
+        for (size_t i = 0; i < g_accounts.size(); ++i) {
+            const AccountData& a = g_accounts[i];
+            if (i > 0) tip += L"\r\n";
+            tip += (a.name.empty() ? a.plan : a.name) + L"\r\n";
+            tip += L"5小时窗口: " + a.fivehPct;
+            if (!a.fivehRst.empty()) tip += L" (重置 " + a.fivehRst + L")";
+            tip += L"\r\n本周配额: " + a.weekPct;
+            if (!a.weekRst.empty()) tip += L" (重置 " + a.weekRst + L")";
+            tip += L"\r\n总池: " + a.poolPct;
+        }
     }
+    if (tip.empty()) tip = L"Kimi 用量";
+    static wchar_t buf[512];
+    lstrcpynW(buf, tip.c_str(), 512);
     TOOLINFOW ti{}; ti.cbSize = sizeof(ti); ti.hwnd = g_hwnd; ti.uId = (UINT_PTR)g_hwnd;
-    ti.lpszText = &tip[0];
+    ti.lpszText = buf;
     SendMessageW(g_tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
 }
 static void CreateTooltip(HWND hwnd) {
@@ -683,6 +782,13 @@ static void ApplyMode(HWND hwnd) {
     LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
 
+    int N = 1;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        N = std::max(1, (int)g_accounts.size());
+    }
+    g_accountCount = N;
+
     if (g_cfg.taskbarMode) {
         DestroyTooltip();
         ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -700,7 +806,8 @@ static void ApplyMode(HWND hwnd) {
         ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         ex |= WS_EX_LAYERED | WS_EX_TOOLWINDOW;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
-        int w = DpiScale(FLOAT_W_96), h = DpiScale(FLOAT_H_96);
+        int w = DpiScale(FLOAT_W_96);
+        int h = DpiScale(FLOAT_H_96 + (N - 1) * ACCOUNT_H_96);
         HWND z = g_cfg.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
         SetWindowPos(hwnd, z, g_cfg.x, g_cfg.y, w, h, SWP_SHOWWINDOW);
         CreateTooltip(hwnd);   // 悬浮窗也支持悬停看重置时间
@@ -710,6 +817,13 @@ static void ApplyMode(HWND hwnd) {
 }
 
 static void Refresh(HWND hwnd) {
+    int N = 1;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        N = std::max(1, (int)g_accounts.size());
+    }
+    // 账户数变化时（用户加/删 key）需要重设窗口尺寸
+    if (N != g_accountCount) { ApplyMode(hwnd); return; }
     UpdateTrayTip();
     if (g_cfg.taskbarMode) { InvalidateRect(hwnd, nullptr, FALSE); UpdateTooltipText(); }
     else { RenderFloating(); UpdateTooltipText(); }
@@ -803,10 +917,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             if (g_cfg.taskbarMode) { Reposition(hwnd); InvalidateRect(hwnd, nullptr, FALSE); UpdateTooltipText(); }
-            else {   // 悬浮窗：剩余分钟各减 1，重绘倒数（总池无倒数）
-                { std::lock_guard<std::mutex> lk(g_mtx);
-                  if (g_shared.fivehRemain > 0) g_shared.fivehRemain--;
-                  if (g_shared.weekRemain > 0) g_shared.weekRemain--; }
+            else {   // 悬浮窗：每个账户剩余分钟各减 1，重绘倒数
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    for (auto& a : g_accounts) {
+                        if (a.fivehRemain > 0) a.fivehRemain--;
+                        if (a.weekRemain > 0) a.weekRemain--;
+                    }
+                }
                 RenderFloating();
             }
             return 0;
