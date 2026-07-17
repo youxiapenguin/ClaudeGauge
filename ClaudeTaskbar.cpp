@@ -515,7 +515,9 @@ static void PaintStrip(HWND hwnd, HDC hdc, RECT& rc) {
         RECT r1{ left, rc.top, right, rc.top + half + DpiScale(1) };
         RECT r2{ left, rc.top + half - DpiScale(1), right, rc.bottom };
         std::wstring title = a.name.empty() ? a.plan : a.name;
+        if (ai == 0 && title.find(L"(主)") == std::wstring::npos) title += L"(主)";
         std::wstring usage = L"5H " + a.fivehPct + L" 周 " + a.weekPct + L" 池 " + a.poolPct;
+        if (a.parLimit > 0) usage += L" · 并发 " + std::to_wstring(a.parUsed) + L"/" + std::to_wstring(a.parLimit);
         SetTextColor(hdc, a.ok ? th.tbTitle : STRIP_WARN);
         DrawTextW(hdc, title.c_str(), -1, &r1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
         SelectObject(hdc, f2);
@@ -613,10 +615,15 @@ static void RenderFloating() {
         for (int ai = 0; ai < N; ++ai) {
             float cy = cyBase + ai * accountH;
             const AccountData& a = accs[ai];
+            // 标题：左侧名称/套餐，右侧并发小字；主号(ai==0)自动加"(主)"
             std::wstring title = a.name.empty() ? a.plan : a.name;
-
-            // 标题
+            if (ai == 0 && title.find(L"(主)") == std::wstring::npos) title += L"(主)";
             g.DrawString(title.c_str(), -1, &fTitle, PointF(left, cy + (REAL)DpiScale(6)), &brTitle);
+            if (a.parLimit > 0) {
+                std::wstring par = L"并发 " + std::to_wstring(a.parUsed) + L"/" + std::to_wstring(a.parLimit);
+                RectF pr(left, cy + (REAL)DpiScale(7), innerW, lineH);
+                g.DrawString(par.c_str(), -1, &fSmall, pr, &sfFar, &brText);
+            }
 
             float rowsTop = cy + (REAL)DpiScale(25);
             std::wstring pcts[3] = { a.fivehPct, a.weekPct, a.poolPct };
